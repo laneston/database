@@ -42,7 +42,6 @@ make install
 
 
 mkdir build && cd build
-cmake ..
 cmake -DCMAKE_TOOLCHAIN_FILE=../aarch32-toolchain.cmake ..
 make
 
@@ -109,3 +108,52 @@ make
 2. 当 MQTT 接收消息的主题是 httpserver/database/request/reboot ，且 payload 内容格式正确 ，则记录 "token" 值（整型数值）;
 3. 记录 "token" 值后，需要立即唤醒 定时读取线程 reader_thread ,确保消息队列 MessageQueue 中的数据已入库并且落盘保存；
 4. 完成步骤 3 的操作后，返回 MQTT 消息，消息主题为 database/httpserver/response/reboot ，payload 内容为 "{"token":123456,"status":"ready"}" ，"token" 值必须与请求报文中的 "token" 值一致；
+
+
+
+
+修改附件中的 .h/cpp 文件，实现以下需求：
+1. 在初始化过程中，使用 devListMsg.h 文件中的功能定义 1 个点表队列用于存储从数据库中读出的点表信息；
+   - devAddr        12 字节十六进制设备地址（来自 plcLocalConfig.json 的 address）
+   - registerAddr   本地点表地址
+   - value          当前值
+   - describe       寄存器属性描述
+   - timestamp_unix 秒级 Unix 时间戳
+2. 在初始化过程中，读取 /root/config/plcLocalConfig.json 文件中的 "address" 键值，譬如 "7BE158680053"，保存到缓存中待使用；
+3. 在初始化过程中，读取 /root/config/plcLocalConfig.json 文件中的 "mode" 键值，如果是 "Slave" ，则订阅并监听 MQTT 主题报文 plcManager/database/notify/dataTimestamp 
+   1. 报文的 payload 为 JSON 格式 {"token": 4521, "timestamp": 1774411200, "register": 65535, "addr": "5FE158680053"}
+   2. "token" 键值为标记当前报文的 ID，无需处理；
+   3. "timestamp" 键值为 unix 时间戳；
+   4. "register" 键值为点表寄存器地址，为 uint16_t 格式的数值，保存到缓存中待使用；
+   5. "addr" 键值是发起台账召测设备的地址，保存到缓存中待使用；
+4. 如果监听到 MQTT 主题报文 plcManager/database/notify/dataTimestamp 需判断 payload 格式是否符合规格：
+5. 如果 payload 格式不符合规格，则将错误信息打印到日志当中；
+6. 如果 payload 格式符合规格，则根据 MQTT 报文的信息，对数据库 CHANNEL01.db 和 CHANNEL02.db 的数据进行读出处理：
+   1. 判断 register 的值是否为 65535，如果是，则从数据库中读取与缓存中的 timestamp 值一致的 adress 值和 value 值，并存入队列当中，以上述 JSON 报文举例：
+      1. 譬如当前的 register 的值为 65535，表示当前的动作为查询所有符合条件的寄存器，与对应寄存器的 value 值；
+      2. 首先将数据库 CHANNEL01.db 中 timestamp 列的 "20260325120000" 时刻的 adress 和 value 值读出，并写入到 std::vector<RegisterMap> map_ 队列当中；
+      3. 譬如 map_[0].devAddr="7BE158680053"; map_[0].registerAddr=16; map_[0].value=200; map_[0].timestamp_unix=1774411200
+      4. 如果还有下 1 节点，则继续读取并写入，譬如 map_[1].devAddr="7BE158680053"; map_[1].registerAddr=17; map_[1].value=100; map_[1].timestamp_unix=1774411200
+      5. 如果当前 CHANNEL01.db 数据库中所有符合 timestamp 值的信息都已写入到队列当中，则继续读取 CHANNEL02.db 数据库的数据，如此类推；
+   2. 如果 register 的值是不是 65535，则从数据库中读取 "timestamp" 和 "register" 的值都符合报文键值条件的信息，存入 std::vector<RegisterMap> map_ 队列当中；
+      1. 譬如 register 的值为 16，timestamp 的值为 "20260325120000"
+      2. 首先将数据库 CHANNEL01.db 中满足 timestamp 列值为 "20260325120000" 和 address 列值为 16 的 value 值读出，并写入到 std::vector<RegisterMap> map_ 队列当中；
+      3. 譬如 map_[0].devAddr="7BE158680053"; map_[0].registerAddr=16; map_[0].value=200; map_[0].timestamp_unix=1774411200
+      4. 如果数据库 CHANNEL01.db 中没有满足条件的寄存器点表值，则继续在数据库 CHANNEL02.db 中进行查找；
+      5. 即 register 的值不为 65535 时，表示指定时间和指点寄存器点表的值，如果 register 的值为 65535(0xFFFF) 表示满足指定时间的所有寄存器点表的值；
+7. 根据上述操作可得知，MQTT 主题报文的 payload 内容中 "timestamp" 键值为 秒级 Unix 时间戳，但是数据库 "timestamp" 列存储的时间戳格式为 "YYYYMMDDHHMMSS"，在进行时间戳匹配前，需转换成 "YYYYMMDDHHMMSS" 格式的 std:string 类型，保存到缓存中待查找使用，譬如 "20260325120000"，但是 RegisterMap.timestamp_unix 类型为 uint64_t 的 unix 时间戳，以上格式转换需要注意；
+8. 按照步骤 6 中对 2 个数据库 CHANNEL01.db 和 CHANNEL02.db 处理完毕后，则将 std::vector<RegisterMap> map_ 队列中的内容读出，并组成 MQTT 主题为 database/plcManager/report/dataTimestamp 的报文，payload 内容为：{"addr": "5FE158680053", "deep": 0, "status": 0, "register": 0, "value": 200, "timestamp": 1774411200} 具体描述如下：
+   1. "addr" 键值是发起台账召测设备的地址，从上述变量缓存中获取；
+   2. "deep" 为中继深度，默认为0；
+   3. "register" 为寄存器点表地址，对应 map_[0].registerAddr
+   4. "value" 为当前寄存器点表地址所对应的数值，对应 map_[0].value
+   5. "status" 值为当前报文的状态值，如果数组 map_ 还没遍历完毕，此状态值为 0 ，如果遍历完毕，状态值为 1
+   6. timestamp 是当前报文的 unix 时间戳，对应 map_[0].timestamp_unix
+9. 如果 registers 对象还没遍历完毕，则进入阻塞状态，仅监听和处理主题报文 plcManager/database/reply/dataTimestamp
+10. 如果 10 秒内没有监听到应答报文 plcManager/database/reply/dataTimestamp ，则视为超时，打印错误日志，退出当前监听动作，重新进入步骤 4 中监听主题 plcManager/database/request/dataTimestamp
+11. 如果监听到有应答报文 plcManager/plcDatabase/reply/dataList ，无需判断 payload 内容，即发送第二帧内容报文 {"addr": "5FE158680053", "deep": 0, "status": 0, "register": 1, "value": 201, "timestamp": 1774411200}
+12. 主题报文 database/plcManager/report/dataTimestamp 发送前需等待 1000ms 后，才发布到 MQTT 总线；
+13. 代码中需包括以上操作的过程日志打印信息，用于调试使用；
+14. 如果 "mode" 为 Master，则无需进行以上操作；
+15. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
+
