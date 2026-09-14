@@ -158,3 +158,14 @@ make
 15. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
 
 mosquitto_pub -h localhost -p 1883 -t "plcManager/database/notify/dataTimestamp" -m  "{\"addr\":\"7BE158680053\",\"register\":65535,\"timestamp\":1789353030,\"token\":31005}"
+
+
+
+当前程序的运行现象如下：
+在从机模式下，程序监听到报文帧 plcManager/database/notify/dataTimestamp {"addr":"7BE158680053","register":65535,"timestamp":1789368060,"token":22191} 之后，如果数据库中没有符合条件的数据，程序会直接返回 MQTT 报文 database/plcManager/report/dataTimestamp {"addr":"7BE158680053","deep":0,"register":0,"status":1,"timestamp":1789368060,"value":0}
+
+以上报文发送至主机后，会误导主机当前报文是有效的，需作出以下修改：
+1. 如果数据库中没有符合条件的数据，返回的 payload 报文中 "status" 键值为 3，表示当前帧无效；
+2. 即 返回 MQTT 报文 database/plcManager/report/dataTimestamp {"addr":"7BE158680053","deep":0,"register":0,"status":3,"timestamp":1789368060,"value":0}
+3. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
+

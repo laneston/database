@@ -113,15 +113,15 @@ void tsQueryWorker(DataBaseManager& dbManager, MqttClient& mqttClient)
     size_t total = g_queryDevList.size();
     LOG_INFO("Loaded " + std::to_string(total) + " records into devList queue.");
 
-    // ---------------- 4. 无数据：直接发结束帧 ----------------
+    // ---------------- 4. 无数据：发送无效结束帧（status=3） ----------------
     if (total == 0) {
       LOG_WARN("No matching records for ts=" + std::to_string(reqTimestamp) + ", reg=" + std::to_string(reqRegister)
-               + ", send end frame directly.");
+               + ", send INVALID end frame (status=3).");
 
       json endFrame;
       endFrame["addr"] = reqAddr;
       endFrame["deep"] = 0;
-      endFrame["status"] = 1;
+      endFrame["status"] = 3; // 3 = 当前帧无效（数据库无匹配数据）
       endFrame["register"] = 0;
       endFrame["value"] = 0;
       endFrame["timestamp"] = reqTimestamp;
@@ -129,9 +129,9 @@ void tsQueryWorker(DataBaseManager& dbManager, MqttClient& mqttClient)
 
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       if (mqttClient.publish("database/plcManager/report/dataTimestamp", payload, 0, false)) {
-        LOG_INFO("Published end frame: " + payload);
+        LOG_INFO("Published invalid end frame (status=3): " + payload);
       } else {
-        LOG_ERROR("Publish end frame failed: " + payload);
+        LOG_ERROR("Publish invalid end frame failed: " + payload);
       }
       continue;
     }
@@ -153,6 +153,7 @@ void tsQueryWorker(DataBaseManager& dbManager, MqttClient& mqttClient)
         break;
       }
 
+      // status: 0 = 中间帧，1 = 最后一帧（正常），3 = 无效帧（无数据时单独发送）
       int status = (i == total - 1) ? 1 : 0;
 
       // 构造上报报文
@@ -607,25 +608,6 @@ int main()
   while (g_running) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
 
   // -------------------------- 修复：优雅退出顺序 --------------------------
-  LOG_INFO("Stopping application...");
-
-  // 1. 先停止所有循环标志
-  g_running = false;
-
-  // 2. 唤醒所有等待中的线程
-  g_tsCv.notify_all();
-  g_cv.notify_all();
-
-  // 3. 关闭 MQTT（让 mqtt_thread 的 run() 退出）
-  client.stop();
-  mqtt_thread.join();
-
-  // 4. join 工作线程
-  if (isSlave && tsWorkerThread.joinable()) { tsWorkerThread.join(); }
-  if (reader_thread.joinable()) { reader_thread.join(); }
-
-  LOG_INFO("Application exited.");
-  return 0; // -------------------------- 修复：优雅退出顺序 --------------------------
   LOG_INFO("Stopping application...");
 
   // 1. 先停止所有循环标志
