@@ -1,11 +1,25 @@
-#include "dbManager.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <sqlite3.h>
 #include <sstream>
 #include <sys/stat.h>
+
+#include "dbManager.h"
 #include "log_manager.hpp" // 假设已有日志宏 LOG_INFO/LOG_ERROR
+
+// Unix秒级时间戳 -> 数据库timestamp格式字符串（YYYYMMDDHHMMSS）
+static std::string unixToDbTs(uint64_t unixSec)
+{
+  time_t t = static_cast<time_t>(unixSec);
+  struct tm tmBuf;
+  if (localtime_r(&t, &tmBuf) == nullptr) { return ""; }
+  char buf[32] = { 0 };
+  strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", &tmBuf);
+  return std::string(buf);
+}
 
 // 辅助：确保目录存在
 static bool ensureDir(const std::string& dir)
@@ -316,4 +330,75 @@ std::string DataBaseManager::getDbPath(int channel) const
   char buf[256];
   snprintf(buf, sizeof(buf), "%s/CHANNEL%02d.db", dbDir_.c_str(), channel);
   return std::string(buf);
+}
+
+std::vector<RegisterMap> DataBaseManager::queryByTimestampAndRegister(uint64_t timestampUnix, uint16_t registerFilter,
+                                                                      const std::string& devAddr)
+{
+  std::vector<RegisterMap> result;
+  std::string tsStr = unixToDbTs(timestampUnix);
+  if (tsStr.empty()) {
+    LOG_ERROR("Invalid unix timestamp: " + std::to_string(timestampUnix));
+    return result;
+  }
+  std::string dateStr = tsStr.substr(0, 8); // 按天分表，表名YYYYMMDD
+  LOG_INFO("Query db: ts=" + tsStr + ", regFilter=" + std::to_string(registerFilter));
+
+  // 依次查询CHANNEL01、CHANNEL02...所有通道
+  for (int ch = 1; ch <= maxChannels_; ++ch) {
+    sqlite3* db = getDbHandle(ch);
+    if (!db) {
+      LOG_WARN("Skip channel " + std::to_string(ch) + ": db open failed");
+      continue;
+    }
+
+    // 检查表是否存在，不存在则跳过
+    std::string checkSql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?;";
+    sqlite3_stmt* checkStmt = nullptr;
+    int rc = sqlite3_prepare_v2(db, checkSql.c_str(), -1, &checkStmt, nullptr);
+    if (rc != SQLITE_OK) {
+      LOG_ERROR("Prepare check table failed, ch" + std::to_string(ch) + ": " + sqlite3_errmsg(db));
+      continue;
+    }
+    sqlite3_bind_text(checkStmt, 1, dateStr.c_str(), -1, SQLITE_STATIC);
+    bool tableExist = (sqlite3_step(checkStmt) == SQLITE_ROW);
+    sqlite3_finalize(checkStmt);
+    if (!tableExist) {
+      LOG_INFO("Table " + dateStr + " not exist in CHANNEL" + std::to_string(ch) + ".db, skip");
+      continue;
+    }
+
+    // 构造SQL：65535查全部，否则查指定寄存器
+    std::string sql = "SELECT address, value, description FROM \"" + dateStr + "\" WHERE timestamp = ?";
+    if (registerFilter != 0xFFFF) { sql += " AND address = ?"; }
+    sql += " ORDER BY address ASC;";
+
+    sqlite3_stmt* stmt = nullptr;
+    rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+      LOG_ERROR("Prepare query failed, ch" + std::to_string(ch) + ": " + sqlite3_errmsg(db));
+      continue;
+    }
+
+    // 绑定参数
+    sqlite3_bind_text(stmt, 1, tsStr.c_str(), -1, SQLITE_STATIC);
+    if (registerFilter != 0xFFFF) { sqlite3_bind_int(stmt, 2, registerFilter); }
+
+    // 读取结果并填充RegisterMap
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      RegisterMap entry;
+      entry.devAddr = devAddr;
+      entry.registerAddr = static_cast<uint16_t>(sqlite3_column_int(stmt, 0));
+      entry.value = static_cast<uint16_t>(sqlite3_column_int(stmt, 1));
+      const unsigned char* desc = sqlite3_column_text(stmt, 2);
+      entry.describe = desc ? reinterpret_cast<const char*>(desc) : "";
+      entry.timestamp_unix = timestampUnix;
+      result.push_back(std::move(entry));
+    }
+    sqlite3_finalize(stmt);
+    LOG_INFO("CHANNEL" + std::to_string(ch) + ".db found records, total now: " + std::to_string(result.size()));
+  }
+
+  LOG_INFO("Query finished, total " + std::to_string(result.size()) + " records");
+  return result;
 }

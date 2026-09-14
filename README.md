@@ -150,10 +150,11 @@ make
    5. "status" 值为当前报文的状态值，如果数组 map_ 还没遍历完毕，此状态值为 0 ，如果遍历完毕，状态值为 1
    6. timestamp 是当前报文的 unix 时间戳，对应 map_[0].timestamp_unix
 9. 如果 registers 对象还没遍历完毕，则进入阻塞状态，仅监听和处理主题报文 plcManager/database/reply/dataTimestamp
-10. 如果 10 秒内没有监听到应答报文 plcManager/database/reply/dataTimestamp ，则视为超时，打印错误日志，退出当前监听动作，重新进入步骤 4 中监听主题 plcManager/database/request/dataTimestamp
-11. 如果监听到有应答报文 plcManager/plcDatabase/reply/dataList ，无需判断 payload 内容，即发送第二帧内容报文 {"addr": "5FE158680053", "deep": 0, "status": 0, "register": 1, "value": 201, "timestamp": 1774411200}
+10. 如果 10 秒内没有监听到应答报文 plcManager/database/reply/dataTimestamp ，则视为超时，打印错误日志，退出当前监听动作，重新进入步骤 4 中监听主题 plcManager/database/notify/dataTimestamp
+11. 如果监听到有应答报文 plcManager/database/reply/dataList ，无需判断 payload 内容，即发送第二帧内容报文 {"addr": "5FE158680053", "deep": 0, "status": 0, "register": 1, "value": 201, "timestamp": 1774411200}
 12. 主题报文 database/plcManager/report/dataTimestamp 发送前需等待 1000ms 后，才发布到 MQTT 总线；
 13. 代码中需包括以上操作的过程日志打印信息，用于调试使用；
 14. 如果 "mode" 为 Master，则无需进行以上操作；
 15. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
 
+mosquitto_pub -h localhost -p 1883 -t "plcManager/database/notify/dataTimestamp" -m  "{\"addr\":\"7BE158680053\",\"register\":65535,\"timestamp\":1789353030,\"token\":31005}"

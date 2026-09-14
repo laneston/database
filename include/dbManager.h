@@ -5,6 +5,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "devListMsg.h"
 #include "modbus_message_queue.h" // 引入 ModbusMasterMsg 定义
 
 struct sqlite3; // 前向声明
@@ -23,6 +25,16 @@ public:
   // 禁止拷贝和赋值
   DataBaseManager(const DataBaseManager&) = delete;
   DataBaseManager& operator=(const DataBaseManager&) = delete;
+
+  /**
+   * @brief 按时间戳+寄存器地址跨通道查询历史数据
+   * @param timestampUnix 秒级Unix时间戳
+   * @param registerFilter 寄存器地址；65535(0xFFFF)表示查询该时刻所有寄存器
+   * @param devAddr 填入结果的设备地址
+   * @return 匹配的RegisterMap结果集
+   */
+  std::vector<RegisterMap> queryByTimestampAndRegister(uint64_t timestampUnix, uint16_t registerFilter,
+                                                       const std::string& devAddr);
 
   /**
    * 写入一条 ModbusMasterMsg 消息到对应的数据库

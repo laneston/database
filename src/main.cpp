@@ -1,8 +1,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <fstream>
 #include <iostream>
 #include <thread>
+
 #include "dbManager.h"
 #include "json.hpp" // 使用 nlohmann/json 库
 #include "log_manager.hpp"
@@ -16,6 +19,217 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 bool g_need_flush = false;      // 由 reboot 请求设置，通知读取线程立即处理
 bool g_flush_completed = false; // 表示处理已完成，用于等待
+
+// -------------------------- 台账召测全局变量 --------------------------
+DevListMsg g_queryDevList; // 点表队列，存储数据库查询结果
+std::string g_localAddr;   // 本地设备地址缓存（address_tmp）
+std::string g_deviceMode;  // 运行模式 Master/Slave
+
+// 同步控制
+std::mutex g_tsMutex;
+std::condition_variable g_tsCv;
+bool g_tsNotifyReceived = false;
+bool g_tsReplyReceived = false;
+uint64_t g_reqTimestamp = 0;
+uint16_t g_reqRegister = 0;
+std::string g_reqAddr; // 发起召测的设备地址
+
+static void onSignal(int /*sig*/) { g_running = false; }
+
+// 加载本地配置 plcLocalConfig.json
+static bool loadPlcLocalConfig(const std::string& path)
+{
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG_ERROR("Failed to open plcLocalConfig: " + path);
+    return false;
+  }
+  try {
+    json root;
+    file >> root;
+    if (!root.contains("address") || !root["address"].is_string()) {
+      LOG_ERROR("plcLocalConfig missing 'address' field");
+      return false;
+    }
+    g_localAddr = root["address"].get<std::string>();
+    if (g_localAddr.length() != 12) {
+      LOG_ERROR("Invalid address length: " + g_localAddr + " (expect 12 hex chars)");
+      return false;
+    }
+
+    if (!root.contains("mode") || !root["mode"].is_string()) {
+      LOG_ERROR("plcLocalConfig missing 'mode' field");
+      return false;
+    }
+    g_deviceMode = root["mode"].get<std::string>();
+
+    LOG_INFO("Load plcLocalConfig success: address=" + g_localAddr + ", mode=" + g_deviceMode);
+    return true;
+  } catch (const json::parse_error& e) {
+    LOG_ERROR("Parse plcLocalConfig failed: " + std::string(e.what()));
+    return false;
+  } catch (const std::exception& e) {
+    LOG_ERROR("plcLocalConfig exception: " + std::string(e.what()));
+    return false;
+  }
+}
+
+// 台账召测工作线程
+void tsQueryWorker(DataBaseManager& dbManager, MqttClient& mqttClient)
+{
+  LOG_INFO("Timestamp query worker thread started.");
+
+  while (g_running) {
+    // ---------------- 1. 等待并快照请求参数 ----------------
+    uint64_t reqTimestamp = 0;
+    uint16_t reqRegister = 0;
+    std::string reqAddr;
+
+    {
+      std::unique_lock<std::mutex> lock(g_tsMutex);
+      g_tsCv.wait(lock, []() { return g_tsNotifyReceived || !g_running; });
+      if (!g_running) break;
+
+      // 快照本次请求参数（避免处理过程中被 MQTT 回调覆盖）
+      reqTimestamp = g_reqTimestamp;
+      reqRegister = g_reqRegister;
+      reqAddr = g_reqAddr;
+
+      // 重置控制标志，准备本次任务
+      g_tsNotifyReceived = false;
+      g_tsReplyReceived = false;
+    }
+
+    LOG_INFO("Start process query: ts=" + std::to_string(reqTimestamp) + ", reg=" + std::to_string(reqRegister)
+             + ", requester=" + reqAddr + ", localAddr=" + g_localAddr);
+
+    // ---------------- 2. 跨通道查询数据库 ----------------
+    std::vector<RegisterMap> queryResult
+      = dbManager.queryByTimestampAndRegister(reqTimestamp, reqRegister, g_localAddr);
+
+    // ---------------- 3. 存入点表队列 ----------------
+    g_queryDevList.clear();
+    for (const auto& entry : queryResult) { g_queryDevList.addRegisterMapEntry(entry); }
+    size_t total = g_queryDevList.size();
+    LOG_INFO("Loaded " + std::to_string(total) + " records into devList queue.");
+
+    // ---------------- 4. 无数据：直接发结束帧 ----------------
+    if (total == 0) {
+      LOG_WARN("No matching records for ts=" + std::to_string(reqTimestamp) + ", reg=" + std::to_string(reqRegister)
+               + ", send end frame directly.");
+
+      json endFrame;
+      endFrame["addr"] = reqAddr;
+      endFrame["deep"] = 0;
+      endFrame["status"] = 1;
+      endFrame["register"] = 0;
+      endFrame["value"] = 0;
+      endFrame["timestamp"] = reqTimestamp;
+      std::string payload = endFrame.dump();
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      if (mqttClient.publish("database/plcManager/report/dataTimestamp", payload, 0, false)) {
+        LOG_INFO("Published end frame: " + payload);
+      } else {
+        LOG_ERROR("Publish end frame failed: " + payload);
+      }
+      continue;
+    }
+
+    // ---------------- 5. 逐帧上报 + 等待应答 ----------------
+    enum class Result { Completed, Timeout, Aborted };
+    Result result = Result::Completed;
+
+    for (size_t i = 0; i < total; ++i) {
+      if (!g_running) {
+        result = Result::Aborted;
+        break;
+      }
+
+      RegisterMap entry;
+      if (!g_queryDevList.getRegisterMap(i, entry)) {
+        LOG_ERROR("Get register failed at index " + std::to_string(i));
+        result = Result::Aborted;
+        break;
+      }
+
+      int status = (i == total - 1) ? 1 : 0;
+
+      // 构造上报报文
+      json frame;
+      frame["addr"] = reqAddr;
+      frame["deep"] = 0;
+      frame["status"] = status;
+      frame["register"] = entry.registerAddr;
+      frame["value"] = entry.value;
+      frame["timestamp"] = entry.timestamp_unix;
+      std::string payload = frame.dump();
+
+      LOG_INFO("Prepare frame " + std::to_string(i + 1) + "/" + std::to_string(total)
+               + ": reg=" + std::to_string(entry.registerAddr) + ", value=" + std::to_string(entry.value)
+               + ", status=" + std::to_string(status) + ", ts=" + std::to_string(entry.timestamp_unix));
+
+      // 发送前等待 1000ms
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+      // 清空应答标志（必须在发布前完成，避免旧标志导致误判）
+      {
+        std::lock_guard<std::mutex> lock(g_tsMutex);
+        g_tsReplyReceived = false;
+      }
+
+      // 发布当前帧
+      if (!mqttClient.publish("database/plcManager/report/dataTimestamp", payload, 0, false)) {
+        LOG_ERROR("Publish frame " + std::to_string(i + 1) + "/" + std::to_string(total) + " failed: " + payload);
+        result = Result::Aborted;
+        break;
+      }
+      LOG_INFO("Published frame " + std::to_string(i + 1) + "/" + std::to_string(total) + ": " + payload);
+
+      // 最后一帧不再等待应答
+      if (status == 1) {
+        LOG_INFO("Last frame sent (status=1), task done without waiting reply.");
+        break;
+      }
+
+      // 等待应答：reply/dataTimestamp 或 reply/dataList，超时 10 秒
+      {
+        std::unique_lock<std::mutex> waitLock(g_tsMutex);
+        bool gotReply
+          = g_tsCv.wait_for(waitLock, std::chrono::seconds(10), []() { return g_tsReplyReceived || !g_running; });
+
+        if (!g_running) {
+          result = Result::Aborted;
+          break;
+        }
+        if (!gotReply) {
+          LOG_ERROR("Wait reply timeout at frame " + std::to_string(i + 1) + "/" + std::to_string(total)
+                    + ", abort current task, back to listen notify/dataTimestamp.");
+          result = Result::Timeout;
+          break;
+        }
+        LOG_INFO("Reply received for frame " + std::to_string(i + 1) + ", continue next frame.");
+      }
+    }
+
+    // ---------------- 6. 任务收尾日志 ----------------
+    switch (result) {
+    case Result::Completed:
+      LOG_INFO("Timestamp query task completed: total=" + std::to_string(total) + ", ts=" + std::to_string(reqTimestamp)
+               + ", addr=" + reqAddr);
+      break;
+    case Result::Timeout:
+      LOG_WARN("Timestamp query task aborted by timeout: ts=" + std::to_string(reqTimestamp) + ", addr=" + reqAddr);
+      break;
+    case Result::Aborted:
+      LOG_WARN("Timestamp query task aborted (running=false or publish failed): ts=" + std::to_string(reqTimestamp)
+               + ", addr=" + reqAddr);
+      break;
+    }
+  }
+
+  LOG_INFO("Timestamp query worker thread exited.");
+}
 
 // 解析 JSON 为 ModbusMasterMsg，严格按照新 RegisterItem 结构
 bool parseModbusMsg(const json& j, ModbusMasterMsg& msg)
@@ -127,27 +341,48 @@ bool parseModbusMsg(const json& j, ModbusMasterMsg& msg)
 
 int main()
 {
+  // ---------- 注册信号处理，保证 Ctrl+C 能优雅退出 ----------
+  std::signal(SIGINT, onSignal);
+  std::signal(SIGTERM, onSignal);
+
   // 初始化日志（可调整参数）
   if (!LogManager::getInstance().init(LogLevel::INFO, "/root/log/database.log", 1024 * 1024, 3600, 10)) {
     std::cerr << "LogManager init failed!" << std::endl;
     return -1;
   }
-  LOG_INFO("Application started.");
 
-  DataBaseManager dbManager(2, 10, "/root/data"); // 最多2个通道，每个数据库最多10张表
+  // 加载本地设备配置
+  if (!loadPlcLocalConfig("/root/config/plcLocalConfig.json")) {
+    std::cerr << "Load plcLocalConfig failed!" << std::endl;
+    return -1;
+  }
+  bool isSlave = (g_deviceMode == "Slave");
 
-  // 创建消息队列（容量 100）
+  // 使用 DevListMsg 缓存本机地址（与需求 2 一致：用 devListMsg.h 的功能保存地址）
+  // loadPlcLocalConfig 已经把 address 解析到 g_localAddr；
+  // 这里再调用一次 DevListMsg::loadDevAddrFromConfig 以保证 devAddr 也能从 DevListMsg 获取。
+  {
+    DevListMsg tmp;
+    if (tmp.loadDevAddrFromConfig("/root/config/plcLocalConfig.json")) {
+      LOG_INFO("DevListMsg cached devAddr = " + tmp.getDevAddrString());
+    } else {
+      LOG_WARN("DevListMsg::loadDevAddrFromConfig failed, use g_localAddr = " + g_localAddr);
+    }
+  }
+
+  LOG_INFO("Application started. mode=" + g_deviceMode);
+
+  DataBaseManager dbManager(2, 10, "/root/data");
+
   MessageQueue mq(100);
 
-  // 配置 MQTT 客户端
   MqttClient client("database_reader");
-  client.setServer("localhost", 1883); // 按实际地址修改
-  // client.setCredentials("username", "password");
+  client.setServer("localhost", 1883);
 
   client.setConnectCallback([]() { LOG_INFO("Connected to MQTT broker."); });
 
   // 消息回调：根据主题分别处理
-  client.setMessageCallback([&mq, &client](const std::string& topic, const std::string& payload) {
+  client.setMessageCallback([&mq, &client, &isSlave](const std::string& topic, const std::string& payload) {
     LOG_INFO("Received message on topic: " + topic);
     LOG_INFO("Received message payload: " + payload);
 
@@ -187,7 +422,6 @@ int main()
         if (j.contains("token") && j["token"].is_number_integer()) {
           int token = j["token"].get<int>();
           LOG_INFO("Valid reboot request with token=" + std::to_string(token));
-
           // 记录 token 值（可存储到全局变量，此处仅记录日志）
           // 唤醒读取线程，立即处理队列并落盘
           {
@@ -196,13 +430,11 @@ int main()
             g_flush_completed = false;
           }
           g_cv.notify_one(); // 唤醒读取线程
-
           // 等待读取线程完成处理（确保入库完成后再返回响应）
           {
             std::unique_lock<std::mutex> lock(g_mutex);
             g_cv.wait(lock, [] { return g_flush_completed; });
           }
-
           // 构造响应
           json response;
           response["token"] = token;
@@ -226,7 +458,7 @@ int main()
       return;
     }
 
-    // 处理数据消息
+    // 数据上报
     if (topic == "modbusMaster/database/report/data") {
       try {
         json j = json::parse(payload);
@@ -238,15 +470,66 @@ int main()
         } else {
           LOG_WARN("Invalid message format, discarded.");
         }
-      } catch (const json::parse_error& e) {
-        LOG_WARN("JSON parse error: " + std::string(e.what()));
       } catch (const std::exception& e) {
         LOG_WARN("Unexpected error: " + std::string(e.what()));
       }
       return;
     }
 
-    // 其他主题不做处理
+    // 台账召测通知
+    if (topic == "plcManager/database/notify/dataTimestamp" && isSlave) {
+      try {
+        json j = json::parse(payload);
+        if (!j.contains("token") || !j["token"].is_number_integer() || !j.contains("timestamp")
+            || !j["timestamp"].is_number_integer() || !j.contains("register") || !j["register"].is_number_integer()
+            || !j.contains("addr") || !j["addr"].is_string()) {
+          LOG_ERROR("Invalid dataTimestamp notify: bad fields format, payload=" + payload);
+          return;
+        }
+        uint64_t ts = j["timestamp"].get<uint64_t>();
+        int regVal = j["register"].get<int>();
+        std::string addr = j["addr"].get<std::string>();
+
+        if (regVal < 0 || regVal > 0xFFFF) {
+          LOG_ERROR("Invalid register value: " + std::to_string(regVal));
+          return;
+        }
+        if (addr.length() != 12) {
+          LOG_ERROR("Invalid addr length: " + addr);
+          return;
+        }
+
+        LOG_INFO("Received ts notify: token=" + std::to_string(j["token"].get<int>()) + ", ts=" + std::to_string(ts)
+                 + ", reg=" + std::to_string(regVal) + ", addr=" + addr);
+
+        {
+          std::lock_guard<std::mutex> lock(g_tsMutex);
+          g_reqTimestamp = ts;
+          g_reqRegister = static_cast<uint16_t>(regVal);
+          g_reqAddr = addr;
+          g_tsNotifyReceived = true;
+        }
+        g_tsCv.notify_one();
+      } catch (const json::parse_error& e) {
+        LOG_ERROR("Parse ts notify failed: " + std::string(e.what()));
+      } catch (const std::exception& e) {
+        LOG_ERROR("Ts notify handler error: " + std::string(e.what()));
+      }
+      return;
+    }
+
+    // 应答报文
+    if ((topic == "plcManager/database/reply/dataTimestamp" || topic == "plcManager/database/reply/dataList")
+        && isSlave) {
+      LOG_INFO("Received ts reply on topic: " + topic);
+      {
+        std::lock_guard<std::mutex> lock(g_tsMutex);
+        g_tsReplyReceived = true;
+      }
+      g_tsCv.notify_all();
+      return;
+    }
+
     LOG_INFO("Ignored message on topic: " + topic);
   });
 
@@ -254,6 +537,14 @@ int main()
   client.subscribe("modbusMaster/database/report/data", 0);
   client.subscribe("modbusMaster/database/request/keepAlive", 0);
   client.subscribe("httpserver/database/request/reboot", 0); // 订阅 reboot 主题
+
+  // Slave模式订阅台账相关主题
+  if (isSlave) {
+    client.subscribe("plcManager/database/notify/dataTimestamp", 0);
+    client.subscribe("plcManager/database/reply/dataTimestamp", 0);
+    client.subscribe("plcManager/database/reply/dataList", 0);
+    LOG_INFO("Slave mode: subscribed all ts topics.");
+  }
 
   // MQTT 运行线程
   std::thread mqtt_thread([&client]() { client.run(); });
@@ -308,16 +599,49 @@ int main()
     LOG_INFO("Reader thread exiting.");
   });
 
+  // 启动台账召测工作线程（仅Slave模式）
+  std::thread tsWorkerThread;
+  if (isSlave) { tsWorkerThread = std::thread(tsQueryWorker, std::ref(dbManager), std::ref(client)); }
+
   LOG_INFO("Application is running. Press Ctrl+C to exit.");
   while (g_running) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
 
-  // 优雅退出
+  // -------------------------- 修复：优雅退出顺序 --------------------------
   LOG_INFO("Stopping application...");
+
+  // 1. 先停止所有循环标志
+  g_running = false;
+
+  // 2. 唤醒所有等待中的线程
+  g_tsCv.notify_all();
+  g_cv.notify_all();
+
+  // 3. 关闭 MQTT（让 mqtt_thread 的 run() 退出）
   client.stop();
   mqtt_thread.join();
+
+  // 4. join 工作线程
+  if (isSlave && tsWorkerThread.joinable()) { tsWorkerThread.join(); }
+  if (reader_thread.joinable()) { reader_thread.join(); }
+
+  LOG_INFO("Application exited.");
+  return 0; // -------------------------- 修复：优雅退出顺序 --------------------------
+  LOG_INFO("Stopping application...");
+
+  // 1. 先停止所有循环标志
   g_running = false;
-  g_cv.notify_all(); // 唤醒读取线程以便退出
-  reader_thread.join();
+
+  // 2. 唤醒所有等待中的线程
+  g_tsCv.notify_all();
+  g_cv.notify_all();
+
+  // 3. 关闭 MQTT（让 mqtt_thread 的 run() 退出）
+  client.stop();
+  mqtt_thread.join();
+
+  // 4. join 工作线程
+  if (isSlave && tsWorkerThread.joinable()) { tsWorkerThread.join(); }
+  if (reader_thread.joinable()) { reader_thread.join(); }
 
   LOG_INFO("Application exited.");
   return 0;
