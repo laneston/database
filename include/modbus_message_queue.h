@@ -17,10 +17,29 @@ struct ModbusMasterMsg {
 
   // 寄存器映射条目
   struct RegisterItem {
-    int address;             // 映射寄存器地址（如16,17...）
-    int map_addr;            // 原寄存器地址（如0,1...)
-    int value;               // 寄存器值
+    int address;             // 本地点表寄存器地址 (local_point_table_addr)
+    int map_addr;            // 传感器寄存器地址 (sensor_register_addr)
+    int value;               // 寄存器值（有符号）
     std::string description; // 描述信息
+
+    // ---------- 阈值相关（可选，来自 modbusmap.json 的 register_mapping） ----------
+    bool threshold;      // 阈值使能标志：true 表示需做阈值判定
+    bool has_upper;      // 是否配置了 upper_threshold
+    bool has_lower;      // 是否配置了 lower_threshold
+    int upper_threshold; // 上限阈值
+    int lower_threshold; // 下限阈值
+
+    RegisterItem()
+      : address(0),
+        map_addr(0),
+        value(0),
+        threshold(false),
+        has_upper(false),
+        has_lower(false),
+        upper_threshold(0),
+        lower_threshold(0)
+    {
+    }
   };
   std::vector<RegisterItem> register_map;
 

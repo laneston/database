@@ -170,27 +170,29 @@ mosquitto_pub -h localhost -p 1883 -t "plcManager/database/notify/dataTimestamp"
 3. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
 
 
+
 # 阈值处理
 
 分析附件中的文件，然后修改附件中的 .h/cpp 文件，实现以下需求：
-1. 在程序初始化过程中，检查 root/config/modbusmap.json 文件中 register_mapping 对象中是否存在 上下限阈值，即 upper_threshold 或 lower_threshold 的键值对，此键值对不是必要选项，所以如果不存在也是正常的，不影响程序执行；
+1. 在程序初始化过程中，检查 root/config/modbusmap.json 文件中 register_mapping 对象中是否存在 上下限阈值，即 upper_threshold 或 lower_threshold 的键值对，此键值对不是必要选项，所以如果不存在也是正常的，不影响程序执行，无需报错；
 2. 如果存在 upper_threshold 或 lower_threshold 的键值对，则将对应寄存器的上下限阈值的键值写入 modbus_message_queue.h 文件的 std::vector<ModbusMasterMsg> buffer_ 队列当中，并将当前节点的阈值使能标志位置为真(true)，表示当前节点的点表寄存器值需进行阈值判定；
-3. 如果不存在 upper_threshold 和 lower_threshold 的键值对，将当前节点的阈值使能标志位置为假(false)，表示当前节点的点表寄存器值需进行阈值判定；
+3. 如果不存在 upper_threshold 和 lower_threshold 的键值对，将当前节点的阈值使能标志位置为假(false)，表示当前节点的点表寄存器值无需进行阈值判定；
 4. 以上需求可根据实际情况设计和修改 ModbusMasterMsg 成员；
-5. 程序监听 MQTT 主题报文 modbusMaster/database/report/data，并将报文信息写入数据库后，如果节点中的阈值使能标志位 buffer_[i].threshold = true，则将报文中的 "value" 键值与阈值进行比较，如果大于 upper_threshold 或者 小于 lower_threshold，则生成一帧告警信息 MQTT 报文 database/plcManager/request/warning；
+5. 程序监听 MQTT 主题报文 modbusMaster/database/report/data，并将报文信息写入数据库后，如果节点中的阈值使能标志位 buffer_[i].threshold = true，则将报文中的 "value" 键值与阈值进行比较，如果大于 upper_threshold 或者 小于 lower_threshold，则生成一帧告警信息 MQTT 报文 database/allapp/notify/warning；
 ```log
 modbusMaster/database/report/data {"channel":1,"id":196,"pdu_addr":1,"pdu_data":"08 00 65 ff 9c 00 67 00 68","pdu_func":3,"register_map":[{"0":0,"description":"湿度值（传感器寄存器0x0000 -> 本地点表0x0000）","value":101},{"1":1,"description":"温度值（传感器寄存器0x0001 -> 本地点表0x0001）","value":65436},{"2":2,"description":"新映射1","value":103},{"3":3,"description":"新映射2","value":104}],"timestamp":"20260919205700"}
 ```
 6. 举一个实际的例子，程序监听到上述报文后，判定 `{"0":0,"description":"湿度值（传感器寄存器0x0000 -> 本地点表0x0000）","value":101}` 节点中(本地寄存器点表为0)的阈值使能标志位 buffer_[i].threshold 是否为 true，如果是 true ，则将 "value" 键值与 "upper_threshold": 200 进行比较，因为 101 小于 200 ，此条件不触发告警操作；
-7. 继续下一个节点信息 `{"1":1,"description":"温度值（传感器寄存器0x0001 -> 本地点表0x0001）","value":-100}` 的判定，阈值使能标志位 buffer_[i].threshold 是 true ，则将 "value" 键值与 "lower_threshold": -10 进行比较，因为 -100 小于 -10 ，此条件触发告警操作；
-8. 因此当前 MQTT 主题报文 modbusMaster/database/report/data 满足触发告警操作，此时立即停止 database/plcManager/report/dataTimestamp 和 database/plcManager/report/dataTimestamp 的报文发送操作，并取消订阅 plcManager/database/notify/dataList 和 plcManager/database/notify/dataTimestamp 主题，即取消以上报文的监听处理，并将当前操作信息打印到日志当中；
+7. 继续分析当前报文下一个节点信息 `{"1":1,"description":"温度值（传感器寄存器0x0001 -> 本地点表0x0001）","value":-100}` 的判定，阈值使能标志位 buffer_[i].threshold 是 true ，则将 "value" 键值与 "lower_threshold": -10 进行比较，因为 -100 小于 -10 ，此条件触发告警操作；
+8. 由于上述报文触发告警操作，所以程序立即生成一帧告警信息 MQTT 报文 database/allapp/notify/warning ，并发送至 MQTT 总线上：
+   1.  payload 为 JSON 格式 {"token": 1472, "addr": "56E058680053", "register": 1, "threshold": -10, "timestamp": 1789368060, "value": -100}
+   2.  "token" 由随机函数生产的 uint16_t 类型的数值；
+   3.  "addr" PLC主机地址，为12字节的字符串，由文件 root/config/PLCMasterAddr 内容获得；
+   4.  "register" 本地点表寄存器地址，是 modbusMaster/database/report/data 报文中键值对 "1":1 的键名 "1"，即 root/config/modbusmap.json 文件中 "local_point_table_addr" 的键值；
+   5.  "threshold" 为当前寄存器阈值，是 root/config/modbusmap.json 文件中 "lower_threshold" 的键值；
+   6.  "timestamp" 是 modbusMaster/database/report/data 报文中 "timestamp":"20260919205700" 的 unix 格式时间戳，需将当前报文的键值 YYYYMMDDHHMMSS 格式字符串转换为 unix 格式时间戳；
+   7.  "value" 是 modbusMaster/database/report/data 报文中 "value" 的键值；
 9. 继续分析当前报文下一个节点信息 `{"2":2,"description":"新映射1","value":103},{"3":3,"description":"新映射2","value":104}` ，阈值使能标志位 buffer_[i].threshold 是 false ，所以当前报文不需要做阈值判定操作；
-10. 至此，modbusMaster/database/report/data 报文分析完毕，程序立即生成一帧告警信息 MQTT 报文 database/plcManager/request/warning：
-    1.  payload 为 JSON 格式 {"token": 1472, "addr": "56E058680053", "register": 1, "threshold": -10, "timestamp": 1789368060, "value": -100}
-    2.  "token" 由随机函数生产的 uint16_t 类型的数值；
-    3.  "addr" PLC主机地址，为12字节的字符串，由文件 root/config/PLCMasterAddr 内容获得；
-    4.  "register" 本地点表寄存器地址，是 modbusMaster/database/report/data 报文中键值对 "1":1 的键名 "1"，即 root/config/modbusmap.json 文件中 "local_point_table_addr" 的键值；
-    5.  "threshold" 为当前寄存器阈值，是 root/config/modbusmap.json 文件中 "lower_threshold" 的键值；
-    6.  "timestamp" 是 modbusMaster/database/report/data 报文中 "timestamp":"20260919205700" 的 unix 格式时间戳，需将当前报文的键值 YYYYMMDDHHMMSS 格式字符串转换为 unix 格式时间戳；
-    7.  "value" 是 modbusMaster/database/report/data 报文中 "value" 的键值；
-11. 
+10. 至此，modbusMaster/database/report/data 报文分析完毕，如果 modbusMaster/database/report/data 主题报文中存在 2 段报文达到触发告警的条件，则分成两个 MQTT 报文 database/allapp/notify/warning 发送到 MQTT 总线上，如果是多段报文达到触发告警的条件，则分成多个 MQTT 报文 database/allapp/notify/warning 发送到 MQTT 总线上；
+11. 程序继续监听并分析一帧 modbusMaster/database/report/data 报文；
+12. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；

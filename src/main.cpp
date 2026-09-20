@@ -1,9 +1,14 @@
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <csignal>
+#include <ctime>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <random>
+#include <sstream>
 #include <thread>
 
 #include "dbManager.h"
@@ -13,6 +18,30 @@
 #include "mqttclient.h"
 
 using json = nlohmann::json;
+
+// ---------- 阈值配置（从 modbusmap.json 加载，key = 本地点表寄存器地址） ----------
+struct ThresholdEntry {
+  bool threshold = false; // 是否使能阈值
+  bool has_upper = false;
+  bool has_lower = false;
+  int upper_threshold = 0;
+  int lower_threshold = 0;
+};
+static std::map<int, ThresholdEntry> g_thresholdMap;
+
+// 主机地址缓存（Slave 模式下从 /root/config/PLCMasterAddr 读取）
+static std::string g_masterAddr;
+
+// 告警主题
+static constexpr const char* MQTT_TOPIC_WARNING = "database/allapp/notify/warning";
+
+// ---------- 告警去重状态 ----------
+// 每个寄存器维护"上次告警时刻"，用于 5 秒最小间隔去重
+//   - 距离上次告警 < 5 秒  → 抑制（避免短时间重复）
+//   - 距离上次告警 ≥ 5 秒  → 立即发布（满足实时性）
+static std::map<int, std::chrono::steady_clock::time_point> g_lastWarningTimeMap;
+static std::mutex g_warningTimeMutex;
+static constexpr int WARNING_MIN_INTERVAL_SECONDS = 5;
 
 std::atomic<bool> g_running{ true };
 std::mutex g_mutex;
@@ -35,6 +64,228 @@ uint16_t g_reqRegister = 0;
 std::string g_reqAddr; // 发起召测的设备地址
 
 static void onSignal(int /*sig*/) { g_running = false; }
+
+// ---------- 从 modbusmap.json 加载阈值信息 ----------
+// 遍历 collection_channels 下所有通道的所有设备的所有 register_mapping，
+// 以 local_point_table_addr 为键收集 (upper_threshold / lower_threshold)。
+// 任一字段存在（is_number）即认为该寄存器需要做阈值判定（threshold = true）。
+// 字段不存在或类型不对时静默跳过（不影响程序执行，符合需求 1）。
+static bool loadThresholdsFromModbusMap(const std::string& path)
+{
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG_WARN("loadThresholds: cannot open modbusmap: " + path);
+    return false;
+  }
+  try {
+    json root;
+    file >> root;
+    if (!root.contains("collection_channels") || !root["collection_channels"].is_object()) {
+      LOG_WARN("loadThresholds: modbusmap missing collection_channels");
+      return false;
+    }
+
+    g_thresholdMap.clear();
+    const auto& channels = root["collection_channels"];
+    for (auto it = channels.begin(); it != channels.end(); ++it) {
+      const auto& channelData = it.value();
+      if (!channelData.is_array()) continue;
+
+      for (const auto& device : channelData) {
+        if (!device.is_object()) continue;
+        if (!device.contains("register_mapping") || !device["register_mapping"].is_array()) continue;
+
+        for (const auto& reg : device["register_mapping"]) {
+          if (!reg.is_object()) continue;
+          if (!reg.contains("local_point_table_addr") || !reg["local_point_table_addr"].is_number_integer()) {
+            continue;
+          }
+          int localAddr = reg["local_point_table_addr"].get<int>();
+
+          ThresholdEntry entry;
+          // 可选字段：upper_threshold / lower_threshold 存在则记录；不存在则忽略
+          if (reg.contains("upper_threshold") && reg["upper_threshold"].is_number()) {
+            entry.has_upper = true;
+            entry.upper_threshold = static_cast<int>(reg["upper_threshold"].get<double>());
+            entry.threshold = true;
+          }
+          if (reg.contains("lower_threshold") && reg["lower_threshold"].is_number()) {
+            entry.has_lower = true;
+            entry.lower_threshold = static_cast<int>(reg["lower_threshold"].get<double>());
+            entry.threshold = true;
+          }
+          g_thresholdMap[localAddr] = entry;
+        }
+      }
+    }
+    LOG_INFO("loadThresholds: loaded " + std::to_string(g_thresholdMap.size()) + " threshold entries.");
+    return true;
+  } catch (const std::exception& e) {
+    LOG_ERROR("loadThresholds exception: " + std::string(e.what()));
+    return false;
+  }
+}
+
+// ---------- 将阈值信息填充到解析后的消息中 ----------
+static void applyThresholds(ModbusMasterMsg& msg)
+{
+  for (auto& reg : msg.register_map) {
+    auto it = g_thresholdMap.find(reg.address);
+    if (it != g_thresholdMap.end()) {
+      reg.threshold = it->second.threshold;
+      reg.has_upper = it->second.has_upper;
+      reg.has_lower = it->second.has_lower;
+      reg.upper_threshold = it->second.upper_threshold;
+      reg.lower_threshold = it->second.lower_threshold;
+    } else {
+      // 该寄存器未配置阈值：明确置为 false，保证下游逻辑一致
+      reg.threshold = false;
+      reg.has_upper = false;
+      reg.has_lower = false;
+      reg.upper_threshold = 0;
+      reg.lower_threshold = 0;
+    }
+  }
+}
+
+// ---------- "YYYYMMDDHHMMSS" -> Unix 秒级时间戳 ----------
+static uint64_t yyyymmddhhmmssToUnix(const std::string& ts)
+{
+  if (ts.size() != 14) {
+    LOG_WARN("yyyymmddhhmmssToUnix: invalid length: " + ts);
+    return 0;
+  }
+  try {
+    std::tm tm = {};
+    tm.tm_year = std::stoi(ts.substr(0, 4)) - 1900;
+    tm.tm_mon = std::stoi(ts.substr(4, 2)) - 1;
+    tm.tm_mday = std::stoi(ts.substr(6, 2));
+    tm.tm_hour = std::stoi(ts.substr(8, 2));
+    tm.tm_min = std::stoi(ts.substr(10, 2));
+    tm.tm_sec = std::stoi(ts.substr(12, 2));
+    tm.tm_isdst = -1;
+    std::time_t t = std::mktime(&tm);
+    if (t == -1) {
+      LOG_WARN("yyyymmddhhmmssToUnix: mktime failed: " + ts);
+      return 0;
+    }
+    return static_cast<uint64_t>(t);
+  } catch (const std::exception& e) {
+    LOG_ERROR("yyyymmddhhmmssToUnix exception: " + std::string(e.what()));
+    return 0;
+  }
+}
+
+// ---------- 读取主机地址（/root/config/PLCMasterAddr） ----------
+static bool loadMasterAddrFromFile(std::string& out)
+{
+  std::ifstream file("/root/config/PLCMasterAddr");
+  if (!file.is_open()) {
+    LOG_WARN("loadMasterAddrFromFile: cannot open /root/config/PLCMasterAddr");
+    return false;
+  }
+  std::string content;
+  std::getline(file, content);
+  // 去除首尾空白
+  while (!content.empty() && (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
+    content.pop_back();
+  }
+  size_t start = 0;
+  while (start < content.size() && (content[start] == ' ' || content[start] == '\t')) ++start;
+  content = content.substr(start);
+
+  if (content.length() != 12) {
+    LOG_WARN("loadMasterAddrFromFile: invalid addr length: " + content);
+    return false;
+  }
+  out = content;
+  return true;
+}
+
+// ---------- 随机 token（uint16_t，非 0） ----------
+static uint16_t generateRandomToken()
+{
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  static std::uniform_int_distribution<uint32_t> dist(0, 0xFFFF);
+  uint16_t t = static_cast<uint16_t>(dist(gen));
+  return (t == 0) ? 1 : t;
+}
+
+// ---------- 阈值校验并发布告警（实时 + 5 秒最小间隔去重） ----------
+// 策略：
+//   1. 每帧报文到达即判断，不等待队列批次处理；
+//   2. 每个寄存器维护独立的"上次告警时刻"；
+//   3. 距离上次告警 < 5 秒 → 抑制；否则 → 立即发布；
+//   4. 若中间有多帧超阈值但都在 5 秒内，仅第一帧发出告警；
+//   5. 若报文间隔 ≥ 5 秒（本场景 10 秒），则每帧都发一次告警，符合"下一帧超阈值继续发"需求。
+//
+// 线程安全：本函数由 MQTT 回调线程调用（mosquitto loop 单线程），
+//           内部对 g_lastWarningTimeMap 加锁，防御未来引入其它调用方。
+static void checkAndPublishWarnings(const ModbusMasterMsg& msg, MqttClient& client)
+{
+  // 仅在 Slave 模式下发送告警
+  if (g_deviceMode != "Slave") return;
+
+  // 懒加载主机地址（一次加载后缓存，之后一直复用）
+  if (g_masterAddr.empty()) {
+    if (!loadMasterAddrFromFile(g_masterAddr)) {
+      LOG_WARN("checkAndPublishWarnings: master addr not available, skip warnings for this msg");
+      return;
+    }
+    LOG_INFO("Master addr loaded: " + g_masterAddr);
+  }
+
+  // 时间戳转换（一次即可，用于告警报文中的 timestamp 字段）
+  uint64_t tsUnix = yyyymmddhhmmssToUnix(msg.timestamp);
+  auto now = std::chrono::steady_clock::now();
+
+  for (const auto& reg : msg.register_map) {
+    // 仅对 threshold = true 的节点做判定
+    if (!reg.threshold) continue;
+
+    // ---------- 1. 判定是否触发 ----------
+    bool upper_triggered = reg.has_upper && reg.value > reg.upper_threshold;
+    bool lower_triggered = reg.has_lower && reg.value < reg.lower_threshold;
+    if (!upper_triggered && !lower_triggered) continue;
+
+    int triggered_threshold = upper_triggered ? reg.upper_threshold : reg.lower_threshold;
+
+    // ---------- 2. 5 秒最小间隔去重 ----------
+    {
+      std::lock_guard<std::mutex> lock(g_warningTimeMutex);
+      auto it = g_lastWarningTimeMap.find(reg.address);
+      if (it != g_lastWarningTimeMap.end()) {
+        auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+        if (elapsedSec < WARNING_MIN_INTERVAL_SECONDS) {
+          // 距上次告警不足 5 秒 → 抑制
+          LOG_DEBUG("Warning suppressed (interval=" + std::to_string(elapsedSec)
+                    + "s < 5s): register=" + std::to_string(reg.address) + ", value=" + std::to_string(reg.value));
+          continue;
+        }
+      }
+      // 允许发布：更新时刻
+      g_lastWarningTimeMap[reg.address] = now;
+    }
+
+    // ---------- 3. 构造并发布告警报文 ----------
+    json warning;
+    warning["token"] = generateRandomToken();
+    warning["addr"] = g_masterAddr;
+    warning["register"] = reg.address;
+    warning["threshold"] = triggered_threshold;
+    warning["timestamp"] = tsUnix;
+    warning["value"] = reg.value;
+
+    std::string payload = warning.dump();
+    if (client.publish(MQTT_TOPIC_WARNING, payload, 0, false)) {
+      LOG_INFO("Warning published (realtime): topic=" + std::string(MQTT_TOPIC_WARNING) + ", payload=" + payload);
+      printf("[告警] 实时发布: %s\n", payload.c_str());
+    } else {
+      LOG_ERROR("Failed to publish warning: " + payload);
+    }
+  }
+}
 
 // 加载本地配置 plcLocalConfig.json
 static bool loadPlcLocalConfig(const std::string& path)
@@ -357,6 +608,12 @@ int main()
     std::cerr << "Load plcLocalConfig failed!" << std::endl;
     return -1;
   }
+
+  // 加载 modbusmap.json 中的阈值配置（可选，不存在不影响程序执行）
+  if (!loadThresholdsFromModbusMap("/root/config/modbusmap.json")) {
+    LOG_WARN("loadThresholdsFromModbusMap failed, threshold check will be disabled.");
+  }
+
   bool isSlave = (g_deviceMode == "Slave");
 
   // 使用 DevListMsg 缓存本机地址（与需求 2 一致：用 devListMsg.h 的功能保存地址）
@@ -465,6 +722,14 @@ int main()
         json j = json::parse(payload);
         ModbusMasterMsg msg;
         if (parseModbusMsg(j, msg)) {
+          // 将 modbusmap.json 中的阈值信息绑定到每条寄存器记录
+          applyThresholds(msg);
+
+          // 新增：实时阈值校验并发布告警（不等待队列批次处理，满足"实时性"需求）
+          // 注意：告警的去重由 checkAndPublishWarnings 内部的 5 秒最小间隔保证
+          checkAndPublishWarnings(msg, client);
+
+          // 再入队等待写库（数据库写入允许稍后批量处理）
           mq.write(msg);
           LOG_INFO("Enqueued msg id=" + std::to_string(msg.id)
                    + ", registers=" + std::to_string(msg.register_map.size()));
@@ -551,7 +816,7 @@ int main()
   std::thread mqtt_thread([&client]() { client.run(); });
 
   // 定时读取线程（每 60 秒清空队列并打印，可被 reboot 请求唤醒）
-  std::thread reader_thread([&mq, &dbManager]() {
+  std::thread reader_thread([&mq, &dbManager, &client]() {
     while (g_running) {
       // 等待 60 秒或被条件变量唤醒
       {
@@ -580,13 +845,11 @@ int main()
           LOG_INFO("  reg: address=" + std::to_string(reg.address) + ", map_addr=" + std::to_string(reg.map_addr)
                    + ", value=" + std::to_string(reg.value) + ", desc=" + reg.description);
         }
+        // 注意：告警校验已移至 MQTT 回调中实时执行，此处不再重复调用，
+        //       以避免同一帧触发两次告警（一次实时、一次延迟）。
       }
       LOG_INFO("Queue reading completed.");
 
-      // 落盘：由于使用 WAL 模式，每个 INSERT 已自动提交，但可强制执行 checkpoint 确保数据完全写入磁盘
-      // 此处可调用 sqlite3_wal_checkpoint，但为简化，假设已持久化。若需严格落盘，可扩展 dbManager 接口。
-      // 这里通过关闭并重新打开数据库连接来强制落盘（代价较大，仅作示例），实际生产应使用 checkpoint。
-      // 为简单，我们仅记录日志。
       LOG_INFO("Data flushed to disk.");
 
       // 重置标志并通知等待的线程
@@ -595,7 +858,7 @@ int main()
         g_need_flush = false;
         g_flush_completed = true;
       }
-      g_cv.notify_all(); // 唤醒可能等待的 reboot 回调
+      g_cv.notify_all();
     }
     LOG_INFO("Reader thread exiting.");
   });
