@@ -272,6 +272,7 @@ static void checkAndPublishWarnings(const ModbusMasterMsg& msg, MqttClient& clie
     json warning;
     warning["token"] = generateRandomToken();
     warning["addr"] = g_masterAddr;
+    warning["deep"] = 0; // 新增 deep 字段，默认值为 0
     warning["register"] = reg.address;
     warning["threshold"] = triggered_threshold;
     warning["timestamp"] = tsUnix;

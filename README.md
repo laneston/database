@@ -196,3 +196,8 @@ modbusMaster/database/report/data {"channel":1,"id":196,"pdu_addr":1,"pdu_data":
 10. 至此，modbusMaster/database/report/data 报文分析完毕，如果 modbusMaster/database/report/data 主题报文中存在 2 段报文达到触发告警的条件，则分成两个 MQTT 报文 database/allapp/notify/warning 发送到 MQTT 总线上，如果是多段报文达到触发告警的条件，则分成多个 MQTT 报文 database/allapp/notify/warning 发送到 MQTT 总线上；
 11. 程序继续监听并分析一帧 modbusMaster/database/report/data 报文；
 12. 实现上述需求的完整功能，如果篇幅受限，仅需输出修改部分的函数完整代码即可；
+
+
+修改附件中的文件，将告警信息 MQTT 报文 database/allapp/notify/warning 的 payload 从 `{"addr":"5FE158680053","register":1,"threshold":-10,"timestamp":1789979970,"token":15889,"value":-15}` 修改为 `{"addr":"5FE158680053","deep": 0,"register":1,"threshold":-10,"timestamp":1789979980,"token":36620,"value":-15}`，在 JSON 报文格式中，增加1个 "deep" 字段，键值默认为 0 
+
+
